@@ -505,6 +505,7 @@ type Config struct {
 		Arguments string `env:"ENGINE_ARGS" required:"false"`
 		Console   string `env:"ENGINE_CONSOLE" required:"false"`
 		GameDir   string `env:"GAME_DIR" required:"true"`
+		Map       string `env:"MAP" required:"false"`
 	}
 	Libraries struct {
 		Client           string `env:"CLIENT_WASM_PATH" required:"true"`
@@ -522,9 +523,11 @@ type EngineConfig struct {
 	Arguments        []string          `json:"arguments"`
 	Console          []string          `json:"console"`
 	GameDir          string            `json:"game_dir"`
+	Map              string            `json:"map"`
 	Libraries        map[string]string `json:"libraries"`
 	DynamicLibraries []string          `json:"dynamic_libraries"`
 	FilesMap         map[string]string `json:"files_map"`
+	DownloadUrl      string            `json:"download_url,omitempty"`
 }
 
 var (
@@ -534,6 +537,7 @@ var (
 
 // configHandler returns the pre-serialized engine configuration
 func configHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(engineConfigJSON)
 }
@@ -597,6 +601,7 @@ func init() {
 		Arguments: sliceArgs(appConfig.Engine.Arguments),
 		Console:   sliceArgs(appConfig.Engine.Console),
 		GameDir:   appConfig.Engine.GameDir,
+		Map:       appConfig.Engine.Map,
 		Libraries: map[string]string{
 			"client":     appConfig.Libraries.Client,
 			"server":     appConfig.Libraries.Server,
@@ -608,12 +613,53 @@ func init() {
 		FilesMap:         parseFilesMap(appConfig.Libraries.FilesMap),
 	}
 
+	// Advertise where clients should download maps from (FastDL).
+	// Default: this server's own /maps/ endpoint (requires IP + WEB_PORT env vars).
+	// Override: set DOWNLOAD_URL to point to a separate CDN.
+	if downloadUrl, ok := os.LookupEnv("DOWNLOAD_URL"); ok && downloadUrl != "" {
+		engineConfig.DownloadUrl = downloadUrl
+	} else if ip, ok := os.LookupEnv("IP"); ok && ip != "" {
+		webPort := os.Getenv("WEB_PORT")
+		if webPort == "" {
+			webPort = strings.TrimPrefix(addr, ":")
+		}
+		engineConfig.DownloadUrl = fmt.Sprintf("http://%s:%s/maps/", ip, webPort)
+	}
+
 	var err error
 	engineConfigJSON, err = json.Marshal(engineConfig)
 	if err != nil {
 		log.Errorf("Failed to serialize config: %v", err)
 		panic(err)
 	}
+}
+
+// mapsHandler serves map files (pk3 / bsp) for client download (FastDL).
+// Lookup order: {gameDir}/maps/{file} then {gameDir}/{file}, so both
+// bsp files (in maps/) and pk3 packages (at game root) are found.
+func mapsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	filename := strings.TrimPrefix(r.URL.Path, "/maps/")
+	// Reject empty names, directory traversal, and subdirectory access.
+	if filename == "" || strings.ContainsAny(filename, "/\\") || strings.Contains(filename, "..") {
+		http.NotFound(w, r)
+		return
+	}
+
+	gameDir := appConfig.Engine.GameDir
+	candidates := []string{
+		filepath.Join("/xashds", gameDir, "maps", filename),
+		filepath.Join("/xashds", gameDir, filename),
+	}
+	for _, path := range candidates {
+		info, err := os.Stat(path)
+		if err == nil && !info.IsDir() {
+			http.ServeFile(w, r, path)
+			return
+		}
+	}
+	http.NotFound(w, r)
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -626,6 +672,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/config":
 		configHandler(w, r)
 	default:
+		if strings.HasPrefix(r.URL.Path, "/maps/") {
+			mapsHandler(w, r)
+			return
+		}
 		p := r.URL.Path
 		if r.URL.Path == "/" {
 			p = "index.html"
